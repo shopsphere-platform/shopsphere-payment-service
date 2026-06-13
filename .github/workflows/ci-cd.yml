@@ -1,0 +1,170 @@
+# ══════════════════════════════════════════════════════════
+# WHY THIS FILE?
+#
+# This workflow lives in EACH Spring Boot service repo
+# (shopsphere-auth-service, shopsphere-product-service, etc.)
+# at: .github/workflows/ci-cd.yml
+#
+# WHAT IT DOES ON EVERY PUSH TO MAIN:
+#   1. Checkout code
+#   2. Run unit tests (mvn test)
+#   3. Build Docker image (uses the existing Dockerfile)
+#   4. Push image to GitHub Container Registry (ghcr.io)
+#   5. Deploy to EKS via helm upgrade
+#
+# COST: Free for public repos (GitHub provides free runners).
+#       Private repos get 2,000 min/month free — enough for ~50
+#       deployments per service per month.
+# ══════════════════════════════════════════════════════════
+
+name: CI/CD Pipeline
+
+# ── TRIGGER ───────────────────────────────────────────────
+# Runs automatically on every push to main branch.
+# Pull requests only run tests (steps 1-2), not deploy.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# ── ENVIRONMENT VARIABLES ────────────────────────────────
+# SERVICE_NAME is set per-repo in GitHub Settings →
+# Secrets and Variables → Actions → Variables.
+# e.g. "auth-service", "product-service", etc.
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository_owner }}/shopsphere-${{ vars.SERVICE_NAME }}
+
+jobs:
+  # ══════════════════════════════════════════════════════
+  # JOB 1: BUILD + TEST
+  # Runs on BOTH push and pull_request — always verify
+  # code compiles and tests pass before anything else.
+  # ══════════════════════════════════════════════════════
+  build:
+    name: Build & Test
+    runs-on: ubuntu-latest
+
+    steps:
+      # Step 1: Get the code onto the runner
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # Step 2: Install Java 21 (matches your local setup
+      # and the eclipse-temurin:21 in your Dockerfiles)
+      - name: Set up Java 21
+        uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+          cache: 'maven'   # caches ~/.m2 between runs — speeds up builds
+
+      # Step 3: Run tests
+      # -B = batch mode (no interactive prompts in CI)
+      - name: Run tests
+        run: mvn -B test
+
+      # Step 4: Build the JAR (skipping tests — already ran above)
+      - name: Build JAR
+        run: mvn -B package -DskipTests
+
+      # Step 5: Upload JAR as artifact so the next job
+      # can use it without rebuilding from scratch
+      - name: Upload JAR artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-jar
+          path: target/*.jar
+          retention-days: 1
+
+  # ══════════════════════════════════════════════════════
+  # JOB 2: DOCKER BUILD + PUSH + DEPLOY
+  # Only runs on push to main (not on pull requests).
+  # Needs job 1 to succeed first (needs: build).
+  # ══════════════════════════════════════════════════════
+  deploy:
+    name: Docker Build, Push & Deploy
+    runs-on: ubuntu-latest
+    needs: build                          # wait for build job to pass
+    if: github.ref == 'refs/heads/main'  # skip on pull requests
+
+    permissions:
+      contents: read
+      packages: write   # needed to push to ghcr.io
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # Download the JAR built in the previous job
+      - name: Download JAR artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: app-jar
+          path: target/
+
+      # Log into GitHub Container Registry
+      # GITHUB_TOKEN is automatically provided by GitHub Actions —
+      # no secret setup needed for ghcr.io on the same org
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Build the Docker image and tag it with:
+      # - the git commit SHA (e.g. :abc1234) for traceability
+      # - "latest" for convenience
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+
+      # Configure kubectl to talk to your EKS cluster.
+      # AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY must be
+      # set in GitHub Settings → Secrets → Actions (per repo
+      # or org-wide). These are the terraform-admin IAM keys.
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-east-2
+
+      - name: Update kubeconfig for EKS
+        run: |
+          aws eks update-kubeconfig \
+            --region us-east-2 \
+            --name shopsphere-dev
+
+      # Install Helm on the runner
+      - name: Install Helm
+        uses: azure/setup-helm@v3
+        with:
+          version: v3.14.4
+
+      # Deploy to Kubernetes using the Helm chart we built.
+      # "helm upgrade --install" = create if not exists,
+      # upgrade if it does. Sets image.tag to the exact
+      # commit SHA so we can trace exactly which code is live.
+      - name: Deploy to EKS with Helm
+        run: |
+          helm upgrade --install ${{ vars.SERVICE_NAME }} \
+            ./kubernetes/helm/microservice \
+            -f ./kubernetes/values/${{ vars.SERVICE_NAME }}.yaml \
+            -n shopsphere \
+            --set image.tag=${{ github.sha }} \
+            --wait \
+            --timeout 5m
+
+      - name: Verify deployment
+        run: |
+          kubectl rollout status deployment/${{ vars.SERVICE_NAME }} \
+            -n shopsphere \
+            --timeout=5m
